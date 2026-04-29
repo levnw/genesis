@@ -41,16 +41,11 @@ app.get('/health', async (req, res) => {
 });
 
 // Proxy routes
+// Note: Express strips the mount prefix from req.url before handing to middleware,
+// so /notion/tasks arrives at the proxy as /tasks — no pathRewrite needed.
 const proxyOpts = (target) => ({
   target,
   changeOrigin: true,
-  pathRewrite: (path) => {
-    // strip the first segment: /scrape/... → /scrape/..., /notion/... → /...
-    // gateway exposes /scrape/*, /notion/*, /ai/* and forwards to each service root
-    const parts = path.split('/');
-    parts.splice(1, 1); // remove prefix segment
-    return parts.join('/') || '/';
-  },
   on: {
     error: (err, req, res) => {
       res.status(502).json({
