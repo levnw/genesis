@@ -63,9 +63,10 @@ function cleanupSession(sessionId) {
 async function askOpenClaw(message) {
   const sessionId = randomUUID();
   try {
+    // No hard timeout — let OpenClaw run as long as it needs
     const { stdout, stderr } = await execFileAsync(OPENCLAW_BIN, [
       'agent', '--agent', 'main', '--session-id', sessionId, '--json', '-m', message,
-    ], { timeout: 30000 });
+    ]);
     const data = extractOpenClawJson(`${stdout}\n${stderr}`);
     if (!data) throw new Error('No JSON from OpenClaw');
     return data.payloads?.map(p => p?.text || '').filter(Boolean).join('\n').trim();
@@ -102,19 +103,25 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.post('/ask', async (req, res) => {
   try {
-    const { question } = req.body || {};
+    const { question, model = 'openclaw' } = req.body || {};
     if (!question) return res.status(400).json({ error: 'MISSING_QUESTION', message: 'question is required' });
 
+    const useModel = model.toLowerCase();
     let answer;
-    try {
-      // OpenClaw primary — it reads IDENTITY.md, calls the Notion API itself, checks memory
-      answer = await askOpenClaw(question);
-    } catch (err) {
-      console.warn('[ai] OpenClaw failed, falling back to Ollama:', err.message);
+
+    if (useModel === 'ollama') {
       answer = await ollamaFallback(question);
+    } else {
+      // openclaw (default) — agent handles everything itself; fall back to Ollama on error
+      try {
+        answer = await askOpenClaw(question);
+      } catch (err) {
+        console.warn('[ai] OpenClaw failed, falling back to Ollama:', err.message);
+        answer = await ollamaFallback(question);
+      }
     }
 
-    res.json({ answer, context_truncated: false });
+    res.json({ answer, model: useModel });
   } catch (err) {
     console.error('[ai] ask error:', err.message);
     res.status(500).json({ error: 'ASK_FAILED', message: err.message });
@@ -123,19 +130,21 @@ app.post('/ask', async (req, res) => {
 
 app.post('/note', async (req, res) => {
   try {
-    const { text } = req.body || {};
+    const { text, model = 'openclaw' } = req.body || {};
     if (!text) return res.status(400).json({ error: 'MISSING_TEXT', message: 'text is required' });
 
+    const useModel = model.toLowerCase();
+    const extractPrompt = `Extract the task name and class name from this note. Reply with ONLY a JSON object: {"taskName": "...", "className": "..."}. If you cannot identify one, set it to null.\n\nNote: ${text}`;
+
     let extraction;
-    try {
-      extraction = await askOpenClaw(
-        `Extract the task name and class name from this note. Reply with ONLY a JSON object: {"taskName": "...", "className": "..."}. If you cannot identify one, set it to null.\n\nNote: ${text}`
-      );
-    } catch {
-      extraction = await askOllama(
-        `Extract the task name and class name from this note. Reply with ONLY a JSON object like {"taskName": "...", "className": "..."}. If unknown set to null. No other text.\n\nNote: ${text}\n\nJSON:`,
-        { temperature: 0.1, num_predict: 100 }
-      );
+    if (useModel === 'ollama') {
+      extraction = await askOllama(`${extractPrompt}\n\nJSON:`, { temperature: 0.1, num_predict: 100 });
+    } else {
+      try {
+        extraction = await askOpenClaw(extractPrompt);
+      } catch {
+        extraction = await askOllama(`${extractPrompt}\n\nJSON:`, { temperature: 0.1, num_predict: 100 });
+      }
     }
 
     let taskName = null, className = null;
