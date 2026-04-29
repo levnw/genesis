@@ -314,14 +314,33 @@ async function scrapeTasks(options = {}) {
 
   console.log(`[scraper] Scraping ${classes.length} class(es)...`);
 
+  // Live progress state — written to status.json after every task
+  const progress = {
+    running:        true,
+    started_at:     new Date().toISOString(),
+    classes_total:  classes.length,
+    classes_done:   0,
+    current_class:  null,
+    tasks_scraped:  0,
+    classes:        classes.map(c => ({ name: c.name, status: 'pending', tasks: 0 })),
+  };
+
+  const writeProgress = () => fsi.writeJson(fsi.statusPath(), progress);
+  writeProgress();
+
   const browser = await chromium.launch({ headless: true });
   const ctx = { ref: await browser.newContext({ storageState: authPath }) };
 
-  let totalTasks = 0;
   try {
-    for (const cls of classes) {
+    for (let i = 0; i < classes.length; i++) {
+      const cls = classes[i];
+      progress.current_class = cls.name;
+      progress.classes[i].status = 'scraping';
+      writeProgress();
+
       try {
         const freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency);
+        let classTasks = 0;
         for (const rawTask of freshTasks) {
           const existing = tasksLib.listTasks(cls.class_id)
             .find(t => t.managebac_url === rawTask.managebac_url);
@@ -344,25 +363,35 @@ async function scrapeTasks(options = {}) {
             teacher_comment:  rawTask.teacher_comment || null,
             scraped_at:       new Date().toISOString(),
           };
-          if (existing) {
-            task.notion_page_id = existing.notion_page_id || null;
-          }
+          if (existing) task.notion_page_id = existing.notion_page_id || null;
           tasksLib.saveTask(cls.class_id, task);
-          totalTasks++;
+          progress.tasks_scraped++;
+          classTasks++;
+          progress.classes[i].tasks = classTasks;
+          writeProgress();
         }
+        progress.classes[i].status = 'done';
       } catch (err) {
         console.error(`[scraper] Error scraping ${cls.name}: ${err.message}`);
+        progress.classes[i].status = 'error';
+        progress.classes[i].error  = err.message;
       }
+
+      progress.classes_done++;
+      writeProgress();
     }
   } finally {
     await ctx.ref.close().catch(() => {});
     await browser.close().catch(() => {});
   }
 
-  const status = { ok: true, totalTasks, classes: classes.length, scraped_at: new Date().toISOString() };
-  fsi.writeJson(fsi.statusPath(), status);
-  console.log(`[scraper] Done. ${totalTasks} tasks saved.`);
-  return status;
+  progress.running       = false;
+  progress.current_class = null;
+  progress.scraped_at    = new Date().toISOString();
+  writeProgress();
+
+  console.log(`[scraper] Done. ${progress.tasks_scraped} tasks saved.`);
+  return { ok: true, totalTasks: progress.tasks_scraped, classes: classes.length, scraped_at: progress.scraped_at };
 }
 
 async function scrapeOneTask(url) {
