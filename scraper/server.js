@@ -114,16 +114,23 @@ app.get('/classes', (req, res) => {
   }
 });
 
-// ── Full scrape ────────────────────────────────────────────────────────────
-app.post('/scrape', async (req, res) => {
-  try {
-    const { speed } = req.body || {};
-    const result = await scrapeTasks({ speed: speed || 'medium' });
-    res.json(result);
-  } catch (err) {
-    console.error('[scraper] scrape error:', err.message);
-    res.status(500).json({ error: 'SCRAPE_FAILED', message: err.message });
+// ── Full scrape (fire-and-forget — poll GET /status for progress) ──────────
+let _scrapeRunning = false;
+
+app.post('/scrape', (req, res) => {
+  if (_scrapeRunning) {
+    return res.status(409).json({ error: 'SCRAPE_IN_PROGRESS', message: 'A scrape is already running. Poll GET /status for progress.' });
   }
+
+  const { speed } = req.body || {};
+  _scrapeRunning = true;
+
+  // Respond immediately — scrape runs in background
+  res.json({ ok: true, message: 'Scrape started. Poll GET /status for live progress.' });
+
+  scrapeTasks({ speed: speed || 'medium' })
+    .catch(err => console.error('[scraper] scrape error:', err.message))
+    .finally(() => { _scrapeRunning = false; });
 });
 
 // ── Targeted single-task scrape ────────────────────────────────────────────
