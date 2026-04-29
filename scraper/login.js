@@ -3,7 +3,7 @@
 const { chromium } = require('playwright');
 const fsi = require('./lib/fs');
 
-const MB_BASE_URL = 'https://app.managebac.com';
+const MB_BASE_URL = 'https://es.managebac.com';
 
 async function login(email, password) {
   if (!email || !password) throw new Error('MB_EMAIL and MB_PASSWORD are required');
