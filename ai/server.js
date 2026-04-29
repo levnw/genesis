@@ -10,21 +10,19 @@ app.use(express.json());
 
 const NOTION_URL    = process.env.NOTION_SERVICE_URL || 'http://localhost:3002';
 const MEMPALACE_URL = process.env.MEMPALACE_URL || 'http://localhost:8765';
-const GPT_MODEL     = process.env.OPENAI_MODEL || 'gpt-4o';
 const OLLAMA_URL    = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_MODEL  = process.env.OLLAMA_MODEL || 'llama3.2';
 
-// Fail fast — don't start if the key isn't set
-if (!process.env.OPENAI_API_KEY) {
-  console.error('[ai] FATAL: OPENAI_API_KEY is not set. Add it to ai/.env and restart.');
-  process.exit(1);
-}
+// Use Ollama as the AI backend via its OpenAI-compatible API — no API key needed
+const GPT_MODEL = process.env.AI_MODEL || OLLAMA_MODEL;
+const openai = new OpenAI({
+  apiKey:  'ollama',
+  baseURL: `${OLLAMA_URL}/v1`,
+});
 
 // Context budget: ~8,000 tokens ≈ 32,000 chars
 const CONTEXT_CHAR_LIMIT = 32000;
 const TASK_DESC_LIMIT    = 1500;
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ── Health ─────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true }));
