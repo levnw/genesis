@@ -6,7 +6,39 @@ const path = require('path');
 const fsi = require('./lib/fs');
 const classesLib = require('./lib/classes');
 const tasksLib = require('./lib/tasks');
-const { MB_BASE_URL } = require('./login');
+const { MB_BASE_URL, login } = require('./login');
+
+// ── Auth guard — call before every scrape ──────────────────────────────────
+// Opens a headless page with the stored session and checks if MB redirects
+// to login. If so, re-authenticates automatically using env credentials.
+async function ensureAuth() {
+  const authPath = fsi.authPath();
+  if (!fs.existsSync(authPath)) throw new Error('No auth session — run POST /login first');
+
+  const email    = process.env.MB_EMAIL;
+  const password = process.env.MB_PASSWORD;
+
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext({ storageState: authPath });
+    const page    = await context.newPage();
+    await page.goto(`${MB_BASE_URL}/student`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    const expired = isLoginPage(page.url());
+    await browser.close();
+
+    if (expired) {
+      console.log('[scraper] Session expired — re-authenticating...');
+      if (!email || !password) throw new Error('Session expired and MB_EMAIL/MB_PASSWORD not set — cannot re-authenticate');
+      await login(email, password);
+      console.log('[scraper] Re-authentication successful.');
+    } else {
+      console.log('[scraper] Session valid.');
+    }
+  } catch (err) {
+    await browser.close().catch(() => {});
+    throw err;
+  }
+}
 
 const SPEED_PRESETS = {
   slow:   { concurrency: 1, taskDelay: 2000 },
@@ -298,8 +330,8 @@ async function scrapeClass(context, cls, taskDelay, taskTimeoutMs, taskConcurren
 }
 
 async function scrapeTasks(options = {}) {
+  await ensureAuth();
   const authPath = fsi.authPath();
-  if (!fs.existsSync(authPath)) throw new Error('No auth session — run POST /login first');
 
   const classes = classesLib.listClasses().filter(c => {
     if (!c.enabled) return false;
@@ -339,7 +371,22 @@ async function scrapeTasks(options = {}) {
       writeProgress();
 
       try {
-        const freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency);
+        let freshTasks;
+        try {
+          freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency);
+        } catch (err) {
+          if (!/session expired/i.test(err.message)) throw err;
+          // Session expired mid-scrape — re-auth and swap in a fresh context
+          console.log(`[scraper] Session expired mid-scrape on "${cls.name}" — re-authenticating...`);
+          const email    = process.env.MB_EMAIL;
+          const password = process.env.MB_PASSWORD;
+          if (!email || !password) throw new Error('Session expired and MB_EMAIL/MB_PASSWORD not set');
+          await login(email, password);
+          await ctx.ref.close().catch(() => {});
+          ctx.ref = await browser.newContext({ storageState: fsi.authPath() });
+          console.log('[scraper] Re-authenticated. Retrying class...');
+          freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency);
+        }
         let classTasks = 0;
         for (const rawTask of freshTasks) {
           const existing = tasksLib.listTasks(cls.class_id)
@@ -395,8 +442,8 @@ async function scrapeTasks(options = {}) {
 }
 
 async function scrapeOneTask(url) {
+  await ensureAuth();
   const authPath = fsi.authPath();
-  if (!fs.existsSync(authPath)) throw new Error('No auth session — run POST /login first');
 
   const taskIdFromUrl = (url.match(/\/core_tasks\/(\d+)/) || [])[1] || String(Date.now());
   const browser = await chromium.launch({ headless: true });
