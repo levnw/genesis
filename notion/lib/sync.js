@@ -3,7 +3,7 @@
 const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { getClient, buildTaskMap, buildTaskProperties, chunkText } = require('./notion');
+const { getClient, buildTaskMap, getDatabaseProperties, buildTaskProperties, chunkText } = require('./notion');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
 
@@ -49,6 +49,28 @@ function hashTask(task) {
     criterionGrades: task.criterionGrades, teacher_comment: task.teacher_comment,
   };
   return crypto.createHash('sha256').update(JSON.stringify(relevant)).digest('hex').slice(0, 16);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withNotionRetry(fn, label = 'Notion request') {
+  let delayMs = 1500;
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = String(err?.message || '');
+      const isRateLimited = err?.code === 'rate_limited' || /rate limited/i.test(msg);
+      if (!isRateLimited || attempt === 6) throw err;
+      const retryAfterSec = Number(err?.headers?.get?.('retry-after') || 0);
+      const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : delayMs;
+      console.warn(`[notion] ${label} rate-limited; retrying in ${waitMs}ms (attempt ${attempt}/6)`);
+      await sleep(waitMs);
+      delayMs = Math.min(delayMs * 2, 60000);
+    }
+  }
 }
 
 // Convert local task attachments to AI-readable text sub-pages on Notion
@@ -104,12 +126,13 @@ async function processAttachments(notion, pageId, task) {
     }
 
     try {
-      await notion.pages.create({
+      await withNotionRetry(() => notion.pages.create({
         parent: { page_id: pageId },
         icon: { type: 'emoji', emoji: '📎' },
         properties: { title: [{ text: { content: subPageTitle } }] },
         children: children.slice(0, 100),
-      });
+      }), `attachment sub-page ${subPageTitle}`);
+      await sleep(350);
     } catch (err) {
       console.warn(`[notion] Failed to create attachment sub-page "${subPageTitle}": ${err.message}`);
     }
@@ -122,41 +145,28 @@ async function syncTask(notion, task, taskMap, options = {}) {
   const hash    = hashTask(task);
   task._genesisHash = hash;
 
+  const supportedProps = options.supportedProps || await getDatabaseProperties(notion, dbId);
   const existing = taskMap.get(task.managebac_url);
 
   if (existing) {
-    // Conflict protection: if genesis_hash differs from what we stored, user edited it
-    const lastHash = existing.genesisHash;
-    if (lastHash && lastHash !== hash && !force) {
-      // Only update fields we know haven't been touched
-      // Safe fields: Submission, Assessment, Grades, Teacher Comment (rarely manually edited)
-      const safeProps = {};
-      const newProps = buildTaskProperties(task);
-
-      // Always update: Submission, Assessment, Grades, Teacher Comment (factual data)
-      for (const field of ['Submission', 'Assessment', 'Grades', 'Teacher Comment', 'genesis_hash']) {
-        if (newProps[field]) safeProps[field] = newProps[field];
-      }
-
-      if (Object.keys(safeProps).length > 0) {
-        await notion.pages.update({ page_id: existing.pageId, properties: safeProps });
-      }
-      return { action: 'partial_update', pageId: existing.pageId };
+    // Skip if nothing changed and not forced
+    if (!force && existing.genesisHash === hash) {
+      return { action: 'skipped', pageId: existing.pageId };
     }
 
-    // Full update — either force or hash matches (no user edits)
-    const props = buildTaskProperties(task);
-    await notion.pages.update({ page_id: existing.pageId, properties: props });
+    // Data changed (or force) — always do a full update
+    const props = buildTaskProperties(task, supportedProps);
+    await withNotionRetry(() => notion.pages.update({ page_id: existing.pageId, properties: props }), `update ${task.name}`);
     taskMap.set(task.managebac_url, { ...existing, genesisHash: hash });
     return { action: 'updated', pageId: existing.pageId };
   }
 
   // Create new page
-  const props = buildTaskProperties(task);
-  const page  = await notion.pages.create({
+  const props = buildTaskProperties(task, supportedProps);
+  const page  = await withNotionRetry(() => notion.pages.create({
     parent: { database_id: dbId },
     properties: props,
-  });
+  }), `create ${task.name}`);
 
   taskMap.set(task.managebac_url, {
     pageId: page.id, title: task.name, genesisHash: hash, icon: null,
@@ -173,30 +183,37 @@ async function syncAll(options = {}) {
   const dbId   = process.env.NOTION_TASKS_DB;
   if (!dbId) throw new Error('NOTION_TASKS_DB not configured');
 
-  const tasks   = loadAllTasks(options.classId || null);
-  const taskMap = await buildTaskMap(notion, dbId);
+  const allTasks = loadAllTasks(options.classId || null);
+  const startAt  = Math.max(0, Number(options.startAt || 0));
+  const limit    = options.limit != null ? Math.max(1, Number(options.limit)) : null;
+  const tasks    = (limit ? allTasks.slice(startAt, startAt + limit) : allTasks.slice(startAt));
+  const taskMap        = await buildTaskMap(notion, dbId);
+  const supportedProps = await getDatabaseProperties(notion, dbId);
 
-  const results = { created: 0, updated: 0, partial: 0, failed: 0 };
+  const results = { created: 0, updated: 0, skipped: 0, failed: 0, startAt, processed: 0, remaining: Math.max(0, allTasks.length - startAt - tasks.length) };
 
   for (const task of tasks) {
     try {
-      const r = await syncTask(notion, task, taskMap, options);
+      const r = await syncTask(notion, task, taskMap, { ...options, supportedProps });
       if (r.action === 'created') {
         results.created++;
         saveTask({ ...task, notion_page_id: r.pageId });
       } else if (r.action === 'updated') {
         results.updated++;
         saveTask({ ...task, notion_page_id: r.pageId });
-      } else if (r.action === 'partial_update') {
-        results.partial++;
+      } else if (r.action === 'skipped') {
+        results.skipped++;
       }
+      results.processed++;
+      await sleep(350);
     } catch (err) {
       console.error(`[notion] sync failed for "${task.name}": ${err.message}`);
       results.failed++;
+      results.processed++;
     }
   }
 
-  return { ok: true, ...results, total: tasks.length, synced_at: new Date().toISOString() };
+  return { ok: true, ...results, total: allTasks.length, batchSize: tasks.length, synced_at: new Date().toISOString() };
 }
 
 module.exports = { syncAll, syncTask, loadAllTasks, hashTask };

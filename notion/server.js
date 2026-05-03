@@ -1,8 +1,8 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const fetch   = require('node-fetch');
-const { getClient, getAllPages, chunkText } = require('./lib/notion');
-const { syncAll, loadAllTasks } = require('./lib/sync');
+const { getClient, getAllPages, chunkText, findDuplicates, buildTaskMap } = require('./lib/notion');
+const { syncAll, loadAllTasks, hashTask } = require('./lib/sync');
 
 const app  = express();
 const PORT = process.env.PORT || 3002;
@@ -13,9 +13,48 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ── Sync all tasks from DATA_DIR to Notion ─────────────────────────────────
+let _syncRunning = false;
+let _syncStatus = { ok: false, message: 'No sync run yet' };
+
 app.post('/sync', async (req, res) => {
+  const force = req.body?.force || false;
+  const classId = req.body?.classId || req.query.classId || null;
+  const startAt = req.body?.startAt ?? req.query.startAt ?? 0;
+  const limit = req.body?.limit ?? req.query.limit ?? null;
+  const asyncMode = req.query.async === 'true' || req.body?.async === true;
+
+  if (asyncMode) {
+    if (_syncRunning) {
+      return res.status(409).json({ error: 'SYNC_IN_PROGRESS', message: 'A sync is already running. Poll GET /sync/status for progress.' });
+    }
+
+    _syncRunning = true;
+    _syncStatus = { ok: true, running: true, started_at: new Date().toISOString(), force, classId, startAt: Number(startAt || 0), limit: limit == null ? null : Number(limit), message: 'Sync started.' };
+    res.json({ ok: true, message: 'Sync started. Poll GET /sync/status for progress.' });
+
+    syncAll({ force, classId, startAt, limit })
+      .then(result => {
+        _syncStatus = { ...result, running: false };
+        const aiUrl = process.env.AI_SERVICE_URL;
+        if (aiUrl && result.created > 0) {
+          triggerEmojiAssignment(result).catch(err =>
+            console.warn('[notion] emoji assignment error:', err.message)
+          );
+        }
+      })
+      .catch(err => {
+        console.error('[notion] sync error:', err.message);
+        _syncStatus = { ok: false, running: false, error: 'SYNC_FAILED', message: err.message, finished_at: new Date().toISOString() };
+      })
+      .finally(() => {
+        _syncRunning = false;
+        if (_syncStatus && !_syncStatus.finished_at) _syncStatus.finished_at = new Date().toISOString();
+      });
+    return;
+  }
+
   try {
-    const result = await syncAll({ force: req.body?.force || false });
+    const result = await syncAll({ force, classId, startAt, limit });
 
     // After sync, trigger emoji assignment via ai/ service (fire-and-forget)
     const aiUrl = process.env.AI_SERVICE_URL;
@@ -30,6 +69,10 @@ app.post('/sync', async (req, res) => {
     console.error('[notion] sync error:', err.message);
     res.status(500).json({ error: 'SYNC_FAILED', message: err.message });
   }
+});
+
+app.get('/sync/status', (req, res) => {
+  res.json(_syncStatus);
 });
 
 // ── Sync a single task by taskId ───────────────────────────────────────────
@@ -265,6 +308,103 @@ async function triggerEmojiAssignment(syncResult) {
     }
   }
 }
+
+// ── Deduplicate Notion pages ───────────────────────────────────────────────
+// GET  /dedupe        → preview what would be removed (dry run)
+// POST /dedupe        → actually archive duplicates
+app.get('/dedupe', async (req, res) => {
+  try {
+    const notion = getClient();
+    const dbId   = process.env.NOTION_TASKS_DB;
+    const dupes  = await findDuplicates(notion, dbId);
+    const total  = dupes.reduce((n, d) => n + d.remove.length, 0);
+    res.json({ duplicateGroups: dupes.length, pagesToRemove: total, preview: dupes });
+  } catch (err) {
+    res.status(500).json({ error: 'DEDUPE_FAILED', message: err.message });
+  }
+});
+
+app.post('/dedupe', async (req, res) => {
+  try {
+    const notion = getClient();
+    const dbId   = process.env.NOTION_TASKS_DB;
+    const dupes  = await findDuplicates(notion, dbId);
+
+    // Respond immediately and stream progress — archiving 200+ pages takes a while
+    res.setHeader('Content-Type', 'application/json');
+
+    let removed = 0, errors = 0;
+    const BATCH_PAUSE = 350; // ms between API calls to stay under rate limit
+
+    for (const { keep, keepTitle, remove } of dupes) {
+      for (const pageId of remove) {
+        try {
+          await notion.pages.update({ page_id: pageId, archived: true });
+          removed++;
+        } catch (err) {
+          errors++;
+          console.warn(`[notion] dedupe archive failed for ${pageId}: ${err.message}`);
+        }
+        await new Promise(r => setTimeout(r, BATCH_PAUSE));
+      }
+    }
+
+    res.json({ ok: true, duplicateGroupsFixed: dupes.length, pagesRemoved: removed, errors });
+  } catch (err) {
+    res.status(500).json({ error: 'DEDUPE_FAILED', message: err.message });
+  }
+});
+
+// ── Debug — understand sync state ─────────────────────────────────────────
+// GET /debug → shows local tasks vs Notion, missing pages, stale hashes, duplicates
+app.get('/debug', async (req, res) => {
+  try {
+    const notion   = getClient();
+    const dbId     = process.env.NOTION_TASKS_DB;
+    const taskMap  = await buildTaskMap(notion, dbId);
+    const dupes    = await findDuplicates(notion, dbId);
+    const local    = loadAllTasks();
+
+    const report = {
+      local_tasks:      local.length,
+      notion_pages:     taskMap.size,
+      duplicate_groups: dupes.length,
+      duplicates:       dupes.map(d => ({ title: d.keepTitle, url: d.url, extra_copies: d.remove.length })),
+      missing_in_notion: [],   // local tasks with no Notion page
+      stale_hash:        [],   // tasks where hash changed (would update on next sync)
+      no_url:            [],   // Notion pages without a URL (can't be matched)
+    };
+
+    for (const task of local) {
+      if (!task.managebac_url) continue;
+      const notionEntry = taskMap.get(task.managebac_url);
+      if (!notionEntry) {
+        report.missing_in_notion.push({ id: task.id, name: task.name, class: task.class_name });
+      } else {
+        const currentHash = hashTask(task);
+        if (notionEntry.genesisHash && notionEntry.genesisHash !== currentHash) {
+          report.stale_hash.push({ id: task.id, name: task.name, class: task.class_name, note: 'will update on next sync' });
+        }
+      }
+    }
+
+    // Check for Notion pages without URL (orphans)
+    const allPages = await getAllPages(notion, dbId);
+    for (const page of allPages) {
+      const url = page.properties?.URL?.url?.trim();
+      if (!url) {
+        report.no_url.push({
+          pageId: page.id,
+          title:  page.properties?.Name?.title?.[0]?.plain_text || '(untitled)',
+        });
+      }
+    }
+
+    res.json(report);
+  } catch (err) {
+    res.status(500).json({ error: 'DEBUG_FAILED', message: err.message });
+  }
+});
 
 app.use((req, res) => res.status(404).json({ error: 'NOT_FOUND', message: `No route for ${req.method} ${req.path}` }));
 
