@@ -34,6 +34,23 @@ function loadAllTasks(classIdFilter = null) {
   return tasks;
 }
 
+// Filter tasks by period: 'today', 'week', 'upcoming', or null (all)
+function filterByPeriod(tasks, period) {
+  if (!period || period === 'all') return tasks;
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+  const weekOut  = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  return tasks.filter(task => {
+    const due = task.due_date ? task.due_date.slice(0, 10) : null;
+    if (!due) return period === 'upcoming'; // no due date: include only for "upcoming"
+    if (period === 'today')    return due === todayStr;
+    if (period === 'week')     return due >= todayStr && due <= weekOut;
+    if (period === 'upcoming') return due >= todayStr;
+    return true;
+  });
+}
+
 function saveTask(task) {
   const taskFile = path.join(DATA_DIR, 'classes', task.class_id, 'tasks', `${task.id}.json`);
   fs.mkdirSync(path.dirname(taskFile), { recursive: true });
@@ -183,7 +200,8 @@ async function syncAll(options = {}) {
   const dbId   = process.env.NOTION_TASKS_DB;
   if (!dbId) throw new Error('NOTION_TASKS_DB not configured');
 
-  const allTasks = loadAllTasks(options.classId || null);
+  const rawTasks = loadAllTasks(options.classId || null);
+  const allTasks = filterByPeriod(rawTasks, options.period || null);
   const startAt  = Math.max(0, Number(options.startAt || 0));
   const limit    = options.limit != null ? Math.max(1, Number(options.limit)) : null;
   const tasks    = (limit ? allTasks.slice(startAt, startAt + limit) : allTasks.slice(startAt));
@@ -216,4 +234,4 @@ async function syncAll(options = {}) {
   return { ok: true, ...results, total: allTasks.length, batchSize: tasks.length, synced_at: new Date().toISOString() };
 }
 
-module.exports = { syncAll, syncTask, loadAllTasks, hashTask };
+module.exports = { syncAll, syncTask, loadAllTasks, filterByPeriod, hashTask };

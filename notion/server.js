@@ -17,11 +17,14 @@ let _syncRunning = false;
 let _syncStatus = { ok: false, message: 'No sync run yet' };
 
 app.post('/sync', async (req, res) => {
-  const force = req.body?.force || false;
-  const classId = req.body?.classId || req.query.classId || null;
-  const startAt = req.body?.startAt ?? req.query.startAt ?? 0;
-  const limit = req.body?.limit ?? req.query.limit ?? null;
+  const force     = req.body?.force    || false;
+  const classId   = req.body?.classId  || req.query.classId  || null;
+  const period    = req.body?.period   || req.query.period   || null;  // 'today'|'week'|'upcoming'|null
+  const startAt   = req.body?.startAt  ?? req.query.startAt  ?? 0;
+  const limit     = req.body?.limit    ?? req.query.limit    ?? null;
   const asyncMode = req.query.async === 'true' || req.body?.async === true;
+
+  const syncOpts = { force, classId, period, startAt, limit };
 
   if (asyncMode) {
     if (_syncRunning) {
@@ -29,18 +32,13 @@ app.post('/sync', async (req, res) => {
     }
 
     _syncRunning = true;
-    _syncStatus = { ok: true, running: true, started_at: new Date().toISOString(), force, classId, startAt: Number(startAt || 0), limit: limit == null ? null : Number(limit), message: 'Sync started.' };
+    _syncStatus = { ok: true, running: true, started_at: new Date().toISOString(), ...syncOpts, message: 'Sync started.' };
     res.json({ ok: true, message: 'Sync started. Poll GET /sync/status for progress.' });
 
-    syncAll({ force, classId, startAt, limit })
+    syncAll(syncOpts)
       .then(result => {
         _syncStatus = { ...result, running: false };
-        const aiUrl = process.env.AI_SERVICE_URL;
-        if (aiUrl && result.created > 0) {
-          triggerEmojiAssignment(result).catch(err =>
-            console.warn('[notion] emoji assignment error:', err.message)
-          );
-        }
+        triggerEmojiAssignment().catch(err => console.warn('[notion] emoji error:', err.message));
       })
       .catch(err => {
         console.error('[notion] sync error:', err.message);
@@ -54,16 +52,9 @@ app.post('/sync', async (req, res) => {
   }
 
   try {
-    const result = await syncAll({ force, classId, startAt, limit });
-
-    // After sync, trigger emoji assignment via ai/ service (fire-and-forget)
-    const aiUrl = process.env.AI_SERVICE_URL;
-    if (aiUrl && result.created > 0) {
-      triggerEmojiAssignment(result).catch(err =>
-        console.warn('[notion] emoji assignment error:', err.message)
-      );
-    }
-
+    const result = await syncAll(syncOpts);
+    // Always run emoji assignment after sync (fire-and-forget)
+    triggerEmojiAssignment().catch(err => console.warn('[notion] emoji error:', err.message));
     res.json(result);
   } catch (err) {
     console.error('[notion] sync error:', err.message);

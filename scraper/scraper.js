@@ -335,6 +335,7 @@ async function scrapeTasks(options = {}) {
 
   const classes = classesLib.listClasses().filter(c => {
     if (!c.enabled) return false;
+    if (options.classId)   return c.class_id === options.classId || String(c.managebac_class_id) === String(options.classId);
     if (options.className) return c.name.toLowerCase().includes(options.className.toLowerCase());
     return true;
   });

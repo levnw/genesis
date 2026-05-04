@@ -122,13 +122,13 @@ app.post('/scrape', (req, res) => {
     return res.status(409).json({ error: 'SCRAPE_IN_PROGRESS', message: 'A scrape is already running. Poll GET /status for progress.' });
   }
 
-  const { speed } = req.body || {};
+  const { speed, period, classId } = req.body || {};
   _scrapeRunning = true;
 
   // Respond immediately — scrape runs in background
   res.json({ ok: true, message: 'Scrape started. Poll GET /status for live progress.' });
 
-  scrapeTasks({ speed: speed || 'medium' })
+  scrapeTasks({ speed: speed || 'medium', period: period || null, classId: classId || null })
     .catch(err => console.error('[scraper] scrape error:', err.message))
     .finally(() => { _scrapeRunning = false; });
 });
