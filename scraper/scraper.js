@@ -179,7 +179,7 @@ async function scrapeTaskPage(page, fullUrl, context, taskIdFromUrl) {
   return data;
 }
 
-async function scrapeClass(context, cls, taskDelay, taskTimeoutMs, taskConcurrency) {
+async function scrapeClass(context, cls, taskDelay, taskTimeoutMs, taskConcurrency, options = {}) {
   const listUrl = `${MB_BASE_URL}/student/classes/${cls.managebac_class_id}/core_tasks?filter=all`;
   const listPage = await context.newPage();
 
@@ -287,9 +287,36 @@ async function scrapeClass(context, cls, taskDelay, taskTimeoutMs, taskConcurren
 
   const seen = new Set();
   const uniqueLinks = taskLinks.filter(x => seen.has(x.href) ? false : (seen.add(x.href), true));
-  console.log(`[scraper]   ${uniqueLinks.length} task(s) in ${cls.name}`);
 
-  const queue = [...uniqueLinks];
+  // ── Period filter: skip task page visits for cached tasks with past due dates ──
+  // We can't know due dates from the list page, but we have them in local cache.
+  // "upcoming" / "week" / "today": only visit task pages that are new or due in the future.
+  let filteredLinks = uniqueLinks;
+  if (options.period && options.period !== 'all') {
+    const cachedTasks = tasksLib.listTasks(cls.class_id);
+    const cacheByUrl  = new Map(cachedTasks.map(t => [t.managebac_url, t]));
+    const todayStr    = new Date().toISOString().slice(0, 10);
+    const weekOut     = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    filteredLinks = uniqueLinks.filter(item => {
+      const fullUrl = item.href.startsWith('http') ? item.href : `${MB_BASE_URL}${item.href}`;
+      const cached  = cacheByUrl.get(fullUrl);
+      if (!cached) return true;                          // never scraped — always include
+      const due = cached.due_date ? cached.due_date.slice(0, 10) : null;
+      if (!due)  return true;                            // no due date cached — include to be safe
+      if (options.period === 'today')    return due === todayStr;
+      if (options.period === 'week')     return due >= todayStr && due <= weekOut;
+      if (options.period === 'upcoming') return due >= todayStr;
+      return true;
+    });
+
+    const skipped = uniqueLinks.length - filteredLinks.length;
+    console.log(`[scraper]   ${filteredLinks.length} task(s) to scrape in ${cls.name} (${skipped} past-due skipped)`);
+  } else {
+    console.log(`[scraper]   ${uniqueLinks.length} task(s) in ${cls.name}`);
+  }
+
+  const queue = [...filteredLinks];
   const freshTasks = [];
 
   async function taskWorker() {
@@ -374,7 +401,7 @@ async function scrapeTasks(options = {}) {
       try {
         let freshTasks;
         try {
-          freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency);
+          freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency, options);
         } catch (err) {
           if (!/session expired/i.test(err.message)) throw err;
           // Session expired mid-scrape — re-auth and swap in a fresh context
@@ -386,7 +413,7 @@ async function scrapeTasks(options = {}) {
           await ctx.ref.close().catch(() => {});
           ctx.ref = await browser.newContext({ storageState: fsi.authPath() });
           console.log('[scraper] Re-authenticated. Retrying class...');
-          freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency);
+          freshTasks = await scrapeClass(ctx.ref, cls, taskDelay, taskTimeoutMs, concurrency, options);
         }
         let classTasks = 0;
         for (const rawTask of freshTasks) {
