@@ -242,6 +242,30 @@ app.post('/note', async (req, res) => {
   }
 });
 
+// ── Create a reminder in Notion ───────────────────────────────────────────
+app.post('/reminder', async (req, res) => {
+  try {
+    const { text, when } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'MISSING_TEXT', message: 'text is required' });
+
+    const notion = getClient();
+    const dbId   = process.env.NOTION_TASKS_DB;
+    const dueIso = when ? new Date(when).toISOString().slice(0, 10) : null;
+
+    const props = {
+      Name:     { title: [{ text: { content: text.slice(0, 2000) } }] },
+      Category: { multi_select: [{ name: 'Reminder' }] },
+    };
+    if (dueIso) props['Due Date'] = { date: { start: dueIso } };
+
+    const page = await notion.pages.create({ parent: { database_id: dbId }, properties: props });
+    res.json({ ok: true, pageId: page.id, title: text, due: dueIso });
+  } catch (err) {
+    console.error('[notion] reminder error:', err.message);
+    res.status(500).json({ error: 'REMINDER_FAILED', message: err.message });
+  }
+});
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 function extractBlockText(block) {
   const richText = block[block.type]?.rich_text || [];
